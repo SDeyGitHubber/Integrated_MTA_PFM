@@ -1,0 +1,5 @@
+torch == 2.6.0+cu124
+pandas == 2.2.2
+numpy == 2.0.2
+matplotlib == 3.10.0
+json == 2.0.9
