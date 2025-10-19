@@ -326,7 +326,7 @@ import math
 import gc
 import torch
 from torch import nn
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import DataLoader, random_split, Subset
 import matplotlib.pyplot as plt
 
 from datasets.pfm_trajectory_dataset_neighbours import PFM_TrajectoryDataset_neighbours
@@ -356,14 +356,14 @@ def clean_tensor(tensor):
 
 def plot_loss(train_losses, val_losses):
     plt.figure(figsize=(10, 6))
-    plt.plot(range(1, len(train_losses)+1), train_losses, label="Train Loss")
-    plt.plot(range(1, len(val_losses)+1), val_losses, label="Validation Loss")
+    plt.plot(range(1, len(train_losses) + 1), train_losses, label="Train Loss")
+    plt.plot(range(1, len(val_losses) + 1), val_losses, label="Validation Loss")
     plt.xlabel("Epoch")
     plt.ylabel("Loss")
     plt.title("Training and Validation Loss per Epoch")
     plt.legend()
     plt.grid(True)
-    plt.savefig("loss_plot.png")
+    plt.savefig("mta_pfm_loss_plot.png")
     plt.show()
 
 
@@ -385,8 +385,12 @@ def train_mta_pfm_model(
     device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"\n[TRAIN] Using device: {device}")
 
+    # === Only use 20% of the dataset ===
     dataset = dataset_class(data_path)
-    print(f"[TRAIN] Loaded dataset with {len(dataset)} samples")
+    full_len = len(dataset)
+    reduced_len = int(full_len * 0.2)
+    dataset = Subset(dataset, list(range(reduced_len)))
+    print(f"[TRAIN] Using 20% subset of dataset: {reduced_len}/{full_len} samples")
 
     val_size = int(0.2 * len(dataset))
     train_size = len(dataset) - val_size
@@ -399,9 +403,9 @@ def train_mta_pfm_model(
         shuffle=True,
         collate_fn=lambda b: collate_fn(
             b,
-            history_len=dataset.history_len,
-            prediction_len=dataset.prediction_len,
-            max_neighbors=dataset.max_neighbors,
+            history_len=dataset.dataset.history_len,
+            prediction_len=dataset.dataset.prediction_len,
+            max_neighbors=dataset.dataset.max_neighbors,
         ),
     )
     val_loader = DataLoader(
@@ -410,9 +414,9 @@ def train_mta_pfm_model(
         shuffle=False,
         collate_fn=lambda b: collate_fn(
             b,
-            history_len=dataset.history_len,
-            prediction_len=dataset.prediction_len,
-            max_neighbors=dataset.max_neighbors,
+            history_len=dataset.dataset.history_len,
+            prediction_len=dataset.dataset.prediction_len,
+            max_neighbors=dataset.dataset.max_neighbors,
         ),
     )
 
@@ -438,6 +442,7 @@ def train_mta_pfm_model(
         model.train()
         epoch_loss = 0.0
 
+        total_batches = len(train_loader)
         for batch_idx, (history_neighbors, future, neighbor_histories, goals, expanded_goals) in enumerate(train_loader):
             history_neighbors = ensure_batch_dim(history_neighbors).to(device)
             future = ensure_batch_dim(future).to(device)
@@ -464,49 +469,27 @@ def train_mta_pfm_model(
 
                     for chunk_idx in range(num_chunks):
                         s, e = chunk_idx * chunk_size, min((chunk_idx + 1) * chunk_size, A)
-
                         hist_chunk = history_neighbors[:, s:e, :, :, :]
                         fut_chunk = future[:, s:e, :, :]
-                        nbr_chunk = neighbor_histories[:, s:e, :, :, :]
                         exp_goal_chunk = expanded_goals[:, s:e, :, :]
 
                         hist_chunk = clean_tensor(hist_chunk)
                         fut_chunk = clean_tensor(fut_chunk)
-                        nbr_chunk = clean_tensor(nbr_chunk)
                         exp_goal_chunk = clean_tensor(exp_goal_chunk)
 
-                        adjusted_preds_chunk, decoded_preds_chunk, coeff_mean, coeff_var = model(
-                            hist_chunk, exp_goal_chunk
-                        )
+                        adjusted_preds_chunk, decoded_preds_chunk, coeff_mean, coeff_var = model(hist_chunk, exp_goal_chunk)
                         ego_pred_chunk = adjusted_preds_chunk[:, :, 0, :, :]
 
-                        if torch.isnan(ego_pred_chunk).any() or torch.isinf(ego_pred_chunk).any():
-                            print(f"[WARN] Model output contains NaN/Inf at batch {batch_idx}, skipping...")
-                            optimizer.zero_grad()
-                            try_free_cuda()
-                            break
-
                         loss_chunk_raw = criterion(ego_pred_chunk, fut_chunk)
-                        if not torch.isfinite(loss_chunk_raw):
-                            print(f"[WARN] Non-finite loss (NaN/Inf) at batch {batch_idx}, skipping...")
-                            loss_chunk_raw = torch.tensor(0.0, device=device)
-                            optimizer.zero_grad()
-                            try_free_cuda()
-                            break
-
                         loss_to_backward = loss_chunk_raw / float(num_chunks)
                         loss_to_backward.backward()
+
                         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                         batch_epoch_loss += loss_chunk_raw.item()
+                        optimizer.step()
 
-                        if chunk_idx % 4 == 0:
-                            try_free_cuda()
-
-                    optimizer.step()
-                    optimizer.zero_grad()
                     epoch_loss += batch_epoch_loss
                     processed_successfully = True
-
                 except RuntimeError as e:
                     if "out of memory" in str(e).lower():
                         print(f"[OOM] Batch {batch_idx}: reducing chunk size {chunk_size} → {max(1, chunk_size // 2)}")
@@ -516,10 +499,9 @@ def train_mta_pfm_model(
                     else:
                         raise e
 
-            if not processed_successfully:
-                print(f"[TRAIN] Skipping batch {batch_idx} after repeated OOM.")
-                try_free_cuda()
-                continue
+            # --- NEW: Progress print ---
+            percent = 100 * (batch_idx + 1) / total_batches
+            print(f">>> {percent:.2f}% of training for epoch {epoch + 1} completed (batch {batch_idx + 1}/{total_batches}) <<<")
 
         avg_train_loss = epoch_loss / max(1, len(train_loader))
         train_losses.append(avg_train_loss)
@@ -529,41 +511,28 @@ def train_mta_pfm_model(
         val_loss = 0.0
         with torch.no_grad():
             for vhist_neighbors, vfuture, vneigh_histories, _, vexp_goals in val_loader:
-                vhist_neighbors = ensure_batch_dim(vhist_neighbors).to(device)
-                vfuture = ensure_batch_dim(vfuture).to(device)
-                vexp_goals = ensure_batch_dim(vexp_goals).to(device)
-
-                vhist_neighbors = clean_tensor(vhist_neighbors)
-                vfuture = clean_tensor(vfuture)
-                vexp_goals = clean_tensor(vexp_goals)
-
-                preds, _, _, _ = model(vhist_neighbors, vexp_goals)
-                ego_pred = preds[:, :, 0, :, :]
-                if torch.isnan(ego_pred).any() or torch.isinf(ego_pred).any():
-                    print(f"[WARN] Validation output contains NaN/Inf, skipping batch.")
-                    continue
-
-                val_loss += criterion(ego_pred, vfuture).item()
+                preds, _, _, _ = model(vhist_neighbors.to(device), vexp_goals.to(device))
+                val_loss += criterion(preds[:, :, 0, :, :], vfuture.to(device)).item()
 
         avg_val_loss = val_loss / max(1, len(val_loader))
         val_losses.append(avg_val_loss)
         print(f"[VAL] Validation Loss: {avg_val_loss:.6f}")
 
+        # Save weights after every epoch
+        epoch_weight_path = f"{model_save_path}_epoch{epoch + 1}.pth"
+        torch.save(model.state_dict(), epoch_weight_path)
+        print(f"💾 Saved model weights: {epoch_weight_path}")
+
         scheduler.step(avg_val_loss)
+
         if avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
-            patience_counter = 0
-            torch.save({"model_state_dict": model.state_dict()}, model_save_path)
-            print(f"✅ Saved new best model → Val Loss: {avg_val_loss:.6f}")
-        else:
-            patience_counter += 1
-            print(f"⚠️ EarlyStopping: {patience_counter}/{patience}")
-
-        if patience_counter >= patience:
-            print("⏹ Early stopping triggered.")
-            break
+            print(f"✅ New best model: Epoch {epoch + 1}, Val Loss {avg_val_loss:.6f}")
 
         try_free_cuda()
 
-    print(f"\n🏁 Training Complete. Best model saved to: {model_save_path}")
+    print(f"\n🏁 Training Complete. Final weights saved to: {model_save_path}")
     plot_loss(train_losses, val_losses)
+
+
+# TO BE USED LATER

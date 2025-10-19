@@ -145,11 +145,11 @@ def test_with_metrics_pfm_nontrainable(data_path, batch_size=1):
 if __name__ == "__main__":
     # Trainable PFM Model
     test_with_metrics_pfm(
-        "/home/dasari-raj-vamsi/Desktop/iDataHub_running/checkpoints/pfm_only_model.pth",
-        "/home/dasari-raj-vamsi/Desktop/iDataHub_running/data/combined_annotations.csv"
+        "/home/amarnath/Desktop/MTP_running/Integrated_MTA_PFM/models/pfm_no_learnable.py",
+        "/home/amarnath/Desktop/MTP_running/Integrated_MTA_PFM/data/combined_annotations.csv"
     )
 
     # Non-Trainable PFM Model
     test_with_metrics_pfm_nontrainable(
-        "/home/dasari-raj-vamsi/Desktop/iDataHub_running/data/combined_annotations.csv"
+        "/home/amarnath/Desktop/MTP_running/Integrated_MTA_PFM/data/combined_annotations.csv"
     )

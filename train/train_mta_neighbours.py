@@ -2,9 +2,9 @@ import os
 import math
 import gc
 import torch
-import time  # <--- INTEGRATED
+import time
 from torch import nn
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import DataLoader, random_split, Subset
 import matplotlib.pyplot as plt
 
 from datasets.pfm_trajectory_dataset_neighbours import PFM_TrajectoryDataset_neighbours
@@ -60,11 +60,16 @@ def train_mta_model(
     device=None,
     max_agents_per_forward=32,
 ):
+
     device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"\n[TRAIN] Using device: {device}")
 
+    # === Use only 20% of dataset ===
     dataset = dataset_class(data_path)
-    print(f"[TRAIN] Loaded dataset with {len(dataset)} samples")
+    full_len = len(dataset)
+    reduced_len = int(full_len * 0.2)
+    dataset = Subset(dataset, range(reduced_len))
+    print(f"[TRAIN] Dataset reduced to 20%: {reduced_len}/{full_len} samples")
 
     val_size = int(0.2 * len(dataset))
     train_size = len(dataset) - val_size
@@ -77,9 +82,9 @@ def train_mta_model(
         shuffle=True,
         collate_fn=lambda b: collate_fn(
             b,
-            history_len=dataset.history_len,
-            prediction_len=dataset.prediction_len,
-            max_neighbors=dataset.max_neighbors,
+            history_len=dataset.dataset.history_len,
+            prediction_len=dataset.dataset.prediction_len,
+            max_neighbors=dataset.dataset.max_neighbors,
         ),
     )
     val_loader = DataLoader(
@@ -88,17 +93,15 @@ def train_mta_model(
         shuffle=False,
         collate_fn=lambda b: collate_fn(
             b,
-            history_len=dataset.history_len,
-            prediction_len=dataset.prediction_len,
-            max_neighbors=dataset.max_neighbors,
+            history_len=dataset.dataset.history_len,
+            prediction_len=dataset.dataset.prediction_len,
+            max_neighbors=dataset.dataset.max_neighbors,
         ),
     )
 
     model = model_class().to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode="min", factor=0.5, patience=3, verbose=True
-    )
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=3, verbose=True)
     criterion = nn.MSELoss()
 
     print("\n=== [TRAIN] Speed Constraints ===")
@@ -108,24 +111,17 @@ def train_mta_model(
 
     best_val_loss = float("inf")
     patience_counter = 0
-    train_losses = []
-    val_losses = []
+    train_losses, val_losses = [], []
 
     for epoch in range(epochs):
         print(f"\n=== [EPOCH {epoch + 1}/{epochs}] ===")
         model.train()
         epoch_loss = 0.0
-
-        # --- BENCHMARK INTEGRATION START ---
         total_batches = len(train_loader)
         batch_times = []
-        # --- BENCHMARK INTEGRATION END ---
 
         for batch_idx, (history_neighbors, future, neighbor_histories, goals, expanded_goals) in enumerate(train_loader):
-            # --- BENCHMARK INTEGRATION START ---
             batch_start = time.time()
-            # --- BENCHMARK INTEGRATION END ---
-
             history_neighbors = ensure_batch_dim(history_neighbors).to(device)
             future = ensure_batch_dim(future).to(device)
             neighbor_histories = ensure_batch_dim(neighbor_histories).to(device)
@@ -151,120 +147,75 @@ def train_mta_model(
 
                     for chunk_idx in range(num_chunks):
                         s, e = chunk_idx * chunk_size, min((chunk_idx + 1) * chunk_size, A)
-
                         hist_chunk = history_neighbors[:, s:e, :, :, :]
                         fut_chunk = future[:, s:e, :, :]
-                        nbr_chunk = neighbor_histories[:, s:e, :, :, :]
                         exp_goal_chunk = expanded_goals[:, s:e, :, :]
 
                         hist_chunk = clean_tensor(hist_chunk)
                         fut_chunk = clean_tensor(fut_chunk)
-                        nbr_chunk = clean_tensor(nbr_chunk)
                         exp_goal_chunk = clean_tensor(exp_goal_chunk)
 
                         adjusted_preds_chunk, decoded_preds_chunk, coeff_mean, coeff_var = model(
                             hist_chunk, exp_goal_chunk
                         )
                         ego_pred_chunk = adjusted_preds_chunk[:, :, 0, :, :]
-
-                        if torch.isnan(ego_pred_chunk).any() or torch.isinf(ego_pred_chunk).any():
-                            print(f"[WARN] Model output contains NaN/Inf at batch {batch_idx}, skipping...")
-                            optimizer.zero_grad()
-                            try_free_cuda()
-                            break
-
                         loss_chunk_raw = criterion(ego_pred_chunk, fut_chunk)
+
                         if not torch.isfinite(loss_chunk_raw):
-                            print(f"[WARN] Non-finite loss (NaN/Inf) at batch {batch_idx}, skipping...")
-                            loss_chunk_raw = torch.tensor(0.0, device=device)
-                            optimizer.zero_grad()
+                            print(f"[WARN] Non-finite loss (NaN/Inf) batch {batch_idx}")
                             try_free_cuda()
                             break
 
-                        loss_to_backward = loss_chunk_raw / float(num_chunks)
-                        loss_to_backward.backward()
+                        (loss_chunk_raw / num_chunks).backward()
                         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                         batch_epoch_loss += loss_chunk_raw.item()
 
-                        if chunk_idx % 4 == 0:
-                            try_free_cuda()
+                        optimizer.step()
 
-                    optimizer.step()
-                    optimizer.zero_grad()
                     epoch_loss += batch_epoch_loss
                     processed_successfully = True
-
                 except RuntimeError as e:
                     if "out of memory" in str(e).lower():
-                        print(f"[OOM] Batch {batch_idx}: reducing chunk size {chunk_size} → {max(1, chunk_size // 2)}")
+                        print(f"[OOM] Batch {batch_idx}: chunk size {chunk_size} → {max(1, chunk_size // 2)}")
                         try_free_cuda()
                         chunk_size = max(1, chunk_size // 2)
                         continue
                     else:
                         raise e
 
-            if not processed_successfully:
-                print(f"[TRAIN] Skipping batch {batch_idx} after repeated OOM.")
-                try_free_cuda()
-                continue
-            
-            # --- BENCHMARK INTEGRATION START ---
+            # --- Benchmark and progress print ---
             batch_end = time.time()
-            batch_elapsed = batch_end - batch_start
-            batch_times.append(batch_elapsed)
-            
-            if (batch_idx + 1) % 10 == 0 or batch_idx == 0:
-                avg_time = sum(batch_times) / len(batch_times)
-                print(
-                    f"[BENCHMARK] Batch {batch_idx+1}/{total_batches} | "
-                    f"Time this batch: {batch_elapsed:.3f}s | "
-                    f"Avg batch time: {avg_time:.3f}s"
-                )
-            # --- BENCHMARK INTEGRATION END ---
+            batch_times.append(batch_end - batch_start)
+            percent = 100 * (batch_idx + 1) / total_batches
+            print(f"[EPOCH {epoch+1}] >>> {percent:.2f}% training done ({batch_idx + 1}/{total_batches}) | "
+                  f"Batch time: {batch_end - batch_start:.2f}s")
 
         avg_train_loss = epoch_loss / max(1, len(train_loader))
         train_losses.append(avg_train_loss)
-        print(f"[EPOCH {epoch + 1}] Train Loss: {avg_train_loss:.6f}")
+        print(f"[EPOCH {epoch+1}] Train Loss: {avg_train_loss:.6f}")
 
         model.eval()
         val_loss = 0.0
         with torch.no_grad():
             for vhist_neighbors, vfuture, vneigh_histories, _, vexp_goals in val_loader:
-                vhist_neighbors = ensure_batch_dim(vhist_neighbors).to(device)
-                vfuture = ensure_batch_dim(vfuture).to(device)
-                vexp_goals = ensure_batch_dim(vexp_goals).to(device)
-
-                vhist_neighbors = clean_tensor(vhist_neighbors)
-                vfuture = clean_tensor(vfuture)
-                vexp_goals = clean_tensor(vexp_goals)
-
-                preds, _, _, _ = model(vhist_neighbors, vexp_goals)
-                ego_pred = preds[:, :, 0, :, :]
-                if torch.isnan(ego_pred).any() or torch.isinf(ego_pred).any():
-                    print(f"[WARN] Validation output contains NaN/Inf, skipping batch.")
-                    continue
-
-                val_loss += criterion(ego_pred, vfuture).item()
+                preds, _, _, _ = model(vhist_neighbors.to(device), vexp_goals.to(device))
+                val_loss += criterion(preds[:, :, 0, :, :], vfuture.to(device)).item()
 
         avg_val_loss = val_loss / max(1, len(val_loader))
         val_losses.append(avg_val_loss)
         print(f"[VAL] Validation Loss: {avg_val_loss:.6f}")
 
+        # --- Save weights after each epoch ---
+        checkpoint_path = f"{model_save_path}_epoch{epoch + 1}.pth"
+        torch.save(model.state_dict(), checkpoint_path)
+        print(f"💾 Saved model weights: {checkpoint_path}")
+
         scheduler.step(avg_val_loss)
         if avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
-            patience_counter = 0
-            torch.save({"model_state_dict": model.state_dict()}, model_save_path)
-            print(f"✅ Saved new best model → Val Loss: {avg_val_loss:.6f}")
-        else:
-            patience_counter += 1
-            print(f"⚠️ EarlyStopping: {patience_counter}/{patience}")
-
-        if patience_counter >= patience:
-            print("⏹ Early stopping triggered.")
-            break
+            print(f"✅ New best model: Epoch {epoch + 1}, Val Loss {avg_val_loss:.6f}")
 
         try_free_cuda()
 
-    print(f"\n🏁 Training Complete. Best model saved to: {model_save_path}")
+    print(f"\n🏁 Training complete. Final model weights saved to: {model_save_path}")
     plot_loss(train_losses, val_losses)
